@@ -1,0 +1,42 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local caches / logs
+.cache/
+*.log
+*.tmp
+
+# TourAPI 원본·상세 캐시 (재수집 가능). 실행용 인덱스는 data/processed/ 를 커밋합니다.
+data/raw/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Editors / OS
+.idea/
+.vscode/
+.cursor/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

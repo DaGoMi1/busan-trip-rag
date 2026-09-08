@@ -1,0 +1,19 @@
+# Frontend
+streamlit
+
+# Backend
+fastapi
+uvicorn[standard]
+
+# ML / AI
+langchain
+langchain-community
+langchain-openai
+faiss-cpu
+torch
+sentence-transformers
+
+# Utilities
+python-dotenv
+pydantic
+requests

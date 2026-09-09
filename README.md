@@ -1,9 +1,9 @@
 # 부산 여행 코스 추천
 
-부산을 방문하는 관광객이 **날짜, 동행, 목적, 숙소, 활동 반경, 활동 강도**를 넣으면  
-TourAPI 장소 데이터를 RAG로 검색해 **숙소 좌표 반경 안의 일차별 코스**를 만듭니다.
+부산을 방문하는 관광객이 **날짜, 동행, 목적, 숙소, 활동 강도**를 넣으면  
+TourAPI 장소 데이터를 RAG로 검색해 **전날·당일 숙소 근처**에서 목적에 맞는 일차별 코스를 만듭니다.
 
-`.env`에 `OPENAI_API_KEY`가 있으면 `gpt-4o-mini`가 일정 문장을 쓰고,  
+`.env`에 `OPENAI_API_KEY`가 있으면 `gpt-4o-mini`가 일정을 조합하고,  
 없으면 FAISS 검색 초안만 반환합니다.
 
 ---
@@ -11,10 +11,13 @@ TourAPI 장소 데이터를 RAG로 검색해 **숙소 좌표 반경 안의 일�
 ## 주요 기능
 
 - 여행 시작일/종료일(최대 7일), 동행자, 목적에 따른 맞춤 검색
-- TourAPI 숙박 목록에서 숙소를 고르고, 그 좌표를 **하루의 시작점**으로 사용
-- 활동 반경(약 3~25km)과 활동 강도(카페 위주 ~ 산·숲)로 후보 필터
-- 한국어 임베딩 + FAISS 유사도 검색, LangChain RAG로 코스 생성
-- Streamlit 입력 → FastAPI `POST /api/recommend`
+- TourAPI 숙박을 고르면 **전날 숙소 + 당일 숙소**를 탐색 앵커로 사용 (OR)
+- **활동 강도 1~5만** 입력 → 하루 장소 수·활동 유형·hop 상한 (반경 슬라이더 없음)
+- 탐색 반경 **기본 2.5km**, 같은 숙소 연속 투숙 시 **2.5 → 3.5 → 4.5…km** 확대 (cap 8km)
+- 목적별 카테고리 쿼터·점수 가산 multi-recall
+- 숙소가 바뀌는 날: 동선을 **전날 숙소 → 당일 숙소** 방향으로 정렬
+- Streamlit → FastAPI `POST /api/recommend`
+- 품질 스모크: `python -m scripts.eval_smoke` ([docs/EVAL.md](docs/EVAL.md))
 
 ---
 
@@ -46,8 +49,14 @@ flowchart LR
     Streamlit --> User
 ```
 
-추천 시 한 번에 부산 전체를 검색하지 않습니다.  
-**일차마다 숙소 위경도 + 반경(km)** 안에서만 후보를 고른 뒤 LLM(또는 초안)에 넘깁니다.
+추천 파이프라인:
+
+1. 일차마다 **전날·당일 숙소** 반경 안에서 목적 쿼터별 multi-recall
+2. 주 카테고리 점수 가산 → 후보 풀 구성 (이전 일차 place id 제외)
+3. LLM이 `SELECTED_IDS_DAY{n}`으로 조합 (키 없으면 `ensure_daily_mix`)
+4. 동선 정렬: 동일 숙소면 NN, **이동일이면 전날→당일 방향** + hop 상한
+
+핵심 모듈: `ml/rag/preferences.py` (규칙) · `retriever.py` (검색) · `chain.py` (오케스트레이션) · `routing.py` (동선)
 
 ---
 
@@ -59,8 +68,20 @@ flowchart LR
 | `companion` | 혼자 / 커플 / 친구 / 가족 / 기타 |
 | `purpose` | 힐링 / 맛집 / 문화관광 / 쇼핑 / 자연/액티비티 / 종합 |
 | `lodging_ids` | TourAPI 숙박 `id`. 1개면 전 기간 동일, 아니면 일차 수만큼 |
-| `radius` | 1~5 → 약 3 / 6 / 10 / 15 / 25 km |
-| `intensity` | 1~5. 하루 장소 수와 산·숲 허용 여부 |
+| `intensity` | 1~5. 하루 장소 수 · 산·숲 등 활동 유형 · hop 상한 |
+
+### 숙소 앵커 · 반경
+
+| 동일 숙소 연속일 | 반경 |
+|------------------|------|
+| 1일차 (stay 0) | 2.5km |
+| 2일차 (stay 1) | 3.5km |
+| 3일차 (stay 2) | 4.5km |
+| … | cap 8km |
+
+- 후보는 **전날 숙소 반경 안**이거나 **당일 숙소 반경 안**이면 통과 (OR).
+- 숙소 변경일 동선: 체크아웃(전날) → 중간 장소 → 체크인(당일) 방향으로 정렬.
+- 다음 날 숙소가 바뀌면 검색 점수에 다음 숙소 근접 가점도 적용.
 
 관련 API:
 
@@ -83,15 +104,18 @@ flowchart LR
 │   ├── schemas/request.py
 │   └── services/recommend_service.py
 ├── ml/
-│   ├── rag/                 # chain, retriever, prompt, preferences
+│   ├── rag/                 # chain, retriever, routing, preferences, prompt, metrics
 │   ├── embeddings/
 │   └── vectorstore/
-├── docs/PROJECT_STATUS.md
+├── docs/
+│   ├── EVAL.md
+│   └── PROJECT_STATUS.md
 ├── scripts/
 │   ├── collect_tourapi.py
-│   └── build_faiss.py
+│   ├── build_faiss.py
+│   └── eval_smoke.py
 └── data/
-    ├── pipeline/            # TourAPI 수집·파싱·정제
+    ├── pipeline/
     ├── raw/
     └── processed/           # busan_places.jsonl, faiss_index/
 ```
@@ -152,19 +176,27 @@ python -m scripts.build_faiss --skip-build --query "해운대 일몰 데이트"
 `.env`를 바꾼 뒤에는 **uvicorn을 다시 시작**하세요.
 
 ```bash
-uvicorn backend.main:app --reload
+python -m uvicorn backend.main:app --reload
 ```
 
 다른 터미널:
 
 ```bash
-streamlit run frontend/app.py
+python -m streamlit run frontend/app.py
 ```
 
 - API: http://localhost:8000
 - UI: http://localhost:8501
 
 포트 8000이 이미 사용 중이면 이전 uvicorn을 종료하거나 `--port 8001`을 쓰고, 프론트의 `API_BASE`를 맞춥니다.
+
+### 5. 평가 스모크
+
+```bash
+python -m scripts.eval_smoke
+```
+
+지표·시나리오·기록은 [docs/EVAL.md](docs/EVAL.md)를 참고하세요.
 
 ---
 

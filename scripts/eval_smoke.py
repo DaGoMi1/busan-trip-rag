@@ -29,7 +29,6 @@ SCENARIOS = [
         "lodging_query": "영도",
         "days": 2,
         "purpose": "자연/액티비티",
-        "radius": 2,
         "intensity": 5,
         "companion": "혼자",
     },
@@ -38,7 +37,6 @@ SCENARIOS = [
         "lodging_query": "해운대",
         "days": 3,
         "purpose": "문화관광",
-        "radius": 3,
         "intensity": 3,
         "companion": "커플",
     },
@@ -47,7 +45,6 @@ SCENARIOS = [
         "lodging_query": "서면",
         "days": 2,
         "purpose": "맛집",
-        "radius": 2,
         "intensity": 3,
         "companion": "친구",
     },
@@ -81,7 +78,6 @@ def run_scenario(rag: CourseRag, scenario: dict, with_llm: bool) -> None:
         companion=scenario["companion"],
         purpose=scenario["purpose"],
         lodging_ids=[str(lodging["id"])],
-        radius=scenario["radius"],
         intensity=scenario["intensity"],
     )
     lodgings = rag.resolve_lodgings(request.lodging_ids)
@@ -93,7 +89,7 @@ def run_scenario(rag: CourseRag, scenario: dict, with_llm: bool) -> None:
     metrics = summarize_metrics(
         day_plans,
         purpose=request.purpose,
-        radius=request.radius,
+        intensity=request.intensity,
         llm_text=llm_text,
     )
     print(f"\n=== {scenario['id']} | {scenario['lodging_query']} | {scenario['purpose']} ===")
@@ -101,8 +97,10 @@ def run_scenario(rag: CourseRag, scenario: dict, with_llm: bool) -> None:
     for key, value in metrics.items():
         print(f"  {key}: {value}")
     for index, plan in enumerate(day_plans, start=1):
+        band = plan.get("radius_km")
+        band_txt = f" r≤{band}km" if band is not None else ""
         names = [f"{h.get('name')}({h.get('category')})" for h in plan["hits"]]
-        print(f"  day{index}: {', '.join(names) if names else '(empty)'}")
+        print(f"  day{index}{band_txt}: {', '.join(names) if names else '(empty)'}")
 
 
 def main() -> None:

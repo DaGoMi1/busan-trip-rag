@@ -105,8 +105,12 @@ LODGING_FIELDS = ("id", "name", "district", "address", "latitude", "longitude")
 
 
 def anchor_radius_km(stay_index: int = 0) -> float:
-    """동일 숙소 연속일(stay_index 0-based)에 따라 base→base+1→… km."""
-    radius = ANCHOR_RADIUS_BASE_KM + max(0, stay_index)
+    """동일 숙소 연속일(stay_index 0-based)에 따라 반경 확대.
+
+    stay 0: 2.5km, stay 1: 4.0km, stay 2: 5.5km … (cap까지).
+    1일차가 근거리 후보를 써도 이후 일자에 여유가 남도록 +1.5km씩 넓힙니다.
+    """
+    radius = ANCHOR_RADIUS_BASE_KM + max(0, stay_index) * 1.5
     return float(min(radius, ANCHOR_RADIUS_CAP_KM))
 
 

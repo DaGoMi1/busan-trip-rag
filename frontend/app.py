@@ -17,8 +17,8 @@ INTENSITY_LABELS = {
 
 st.set_page_config(page_title="부산 여행 코스 추천", page_icon="🏖️", layout="wide")
 
-st.title("🏖️ 부산 여행 코스 추천")
-st.subheader("전날·당일 숙소 근처에서, 목적에 맞는 하루 코스를 만듭니다")
+st.title("🏖️ 부산 여행 코스")
+st.subheader("숙소 근처에서, 하루 흐름에 맞는 코스를 붙여 드려요")
 
 
 @st.cache_data(ttl=60)
@@ -55,7 +55,7 @@ with st.sidebar:
     st.caption(INTENSITY_LABELS[intensity])
     st.caption(
         "탐색은 전날 숙소 또는 당일 숙소 각 2km 이내(OR). "
-        "같은 숙소에 여러 날 묵으면 2→3→4km로 조금씩 넓어집니다."
+        "같은 숙소에 여러 날 묵으면 2.5→4→5.5km로 조금씩 넓어집니다."
     )
 
     days = (end_date - start_date).days + 1

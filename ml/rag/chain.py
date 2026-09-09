@@ -87,7 +87,6 @@ class CourseRag:
         bucket_size = pick_n * 2 if for_llm else pick_n
         day_lodgings = _expand_lodgings(lodgings, request.days)
         plans: list[dict[str, Any]] = []
-        used_ids: set[str] = set()
 
         for day_index, trip_date in enumerate(dates):
             today = day_lodgings[day_index]
@@ -102,7 +101,7 @@ class CourseRag:
                 if str(nxt.get("id")) != str(today.get("id")):
                     next_lodging = nxt
 
-            exclude = set(used_ids)
+            exclude = set()
             for anchor in anchors:
                 exclude.add(str(anchor.get("id")))
 
@@ -123,8 +122,6 @@ class CourseRag:
                     "radius_km": radius_km,
                 }
             )
-            for hit in capped:
-                used_ids.add(str(hit.get("id") or hit.get("name")))
         return plans
 
     def _narrow_plans(
@@ -134,23 +131,31 @@ class CourseRag:
     ) -> list[dict[str, Any]]:
         pick_n = INTENSITY_PICK[request.intensity]
         narrowed: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
         for plan in candidate_plans:
             lodging = plan["lodging"]
             start, end = route_start_and_end(lodging, plan.get("anchors"))
             radius = float(plan.get("radius_km") or ANCHOR_RADIUS_BASE_KM)
             hop_limit = max_hop_km(request.intensity, radius)
-            mixed = ensure_daily_mix(plan["hits"], pick_n, request.purpose)
+            pool = [
+                hit
+                for hit in plan["hits"]
+                if str(hit.get("id") or hit.get("name")) not in used_ids
+            ]
+            mixed = ensure_daily_mix(pool, pick_n, request.purpose)
             ordered = order_day_route(start, mixed, destination=end) if mixed else []
             ordered = enforce_max_hop(
                 start,
                 ordered,
                 hop_limit,
-                pool=plan["hits"],
+                pool=pool,
                 purpose=request.purpose,
                 pick_n=pick_n,
                 destination=end,
             )
             narrowed.append({**plan, "hits": ordered})
+            for hit in ordered:
+                used_ids.add(str(hit.get("id") or hit.get("name")))
         return narrowed
 
     def _search_weighted_hits(
@@ -239,7 +244,7 @@ class CourseRag:
         if radii:
             band_text = (
                 f"전날·당일 숙소 각각 {min(radii):.0f}~{max(radii):.0f}km 이내 "
-                f"(OR, 동일 숙소면 2→3→4km 확대)"
+                f"(OR, 동일 숙소면 2.5→4→5.5km 확대)"
             )
         else:
             band_text = "전날·당일 숙소 각 2km 이내(OR)"
@@ -266,7 +271,7 @@ class CourseRag:
         if not any(plan["hits"] for plan in final_plans):
             final_plans = self._narrow_plans(request, candidate_plans)
             body = self._generate_extractive(request, final_plans)
-            return body + "\n\n_(LLM 선택 id 파싱에 실패해 검색 기반 일정으로 대체했습니다.)_\n"
+            return body + "\n\n_(장소 id를 읽지 못해, 검색 결과로 일정을 다시 붙였어요.)_\n"
         return render_composed_course(request, final_plans, raw)
 
     def _get_rag_chain(self):
@@ -282,37 +287,12 @@ class CourseRag:
         request: RecommendRequest,
         day_plans: list[dict[str, Any]],
     ) -> str:
-        lines = [
-            f"## 부산 {request.days}일 여행 코스 (검색 기반 초안)",
-            "",
-            f"- 기간: {request.start_date.isoformat()} ~ {request.end_date.isoformat()}",
-            f"- 동행: {request.companion} / 목적: {request.purpose} / 활동 강도: {request.intensity}/5",
-            "- OPENAI_API_KEY가 없어 LLM 조합 없이, 이중 숙소 앵커·목적 가중 검색·NN 동선 결과를 반환합니다.",
-            "",
-        ]
-        for day_index, plan in enumerate(day_plans, start=1):
-            lines.append(_day_route_header(day_index, plan))
-            picked = plan["hits"]
-            if not picked:
-                lines.append("- 탐색 밴드 안에서 후보를 찾지 못했습니다.")
-                lines.append("")
-                continue
-            for place in picked:
-                distance = place.get("distance_km")
-                hop = place.get("hop_km")
-                distance_text = f", 숙소 {distance}km" if distance is not None else ""
-                hop_text = f", 이전→{hop}km" if hop is not None else ""
-                lines.append(
-                    f"- **{place.get('name')}** "
-                    f"({place.get('category')}, {place.get('district')}{distance_text}{hop_text})"
-                )
-                overview = (place.get("overview") or place.get("page_content") or "").strip()
-                if overview:
-                    lines.append(
-                        f"  - {overview[:120]}{'...' if len(overview) > 120 else ''}"
-                    )
-            lines.append("")
-        return "\n".join(lines)
+        return render_course_markdown(
+            request,
+            day_plans,
+            reasons={},
+            draft_note="검색 결과로 먼저 붙여 본 초안이에요. (API 키가 없어 AI 문장 조합은 생략)",
+        )
 
 
 def create_course_chain(llm) -> Any:
@@ -386,18 +366,22 @@ def apply_llm_selections(
 ) -> list[dict[str, Any]]:
     selected_by_day = parse_selected_ids(llm_text)
     final_plans: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
     for day_index, plan in enumerate(candidate_plans, start=1):
         lodging = plan["lodging"]
         start, end = route_start_and_end(lodging, plan.get("anchors"))
         radius = float(plan.get("radius_km") or ANCHOR_RADIUS_BASE_KM)
         day_hop = max_hop_km(intensity, radius)
+        pool = [
+            hit
+            for hit in plan.get("hits") or []
+            if str(hit.get("id") or hit.get("name")) not in used_ids
+        ]
         id_map = {
-            str(hit.get("id") or hit.get("name")): hit for hit in plan.get("hits") or []
+            str(hit.get("id") or hit.get("name")): hit for hit in pool
         }
         name_map = {
-            str(hit.get("name")): hit
-            for hit in plan.get("hits") or []
-            if hit.get("name")
+            str(hit.get("name")): hit for hit in pool if hit.get("name")
         }
         chosen_ids = selected_by_day.get(day_index) or []
         selected: list[dict[str, Any]] = []
@@ -414,21 +398,75 @@ def apply_llm_selections(
             if len(selected) >= pick_n:
                 break
         if not selected:
-            selected = _match_names_from_text(llm_text, plan.get("hits") or [], pick_n)
-        if not selected:
-            selected = ensure_daily_mix(plan.get("hits") or [], pick_n, purpose)
+            selected = _match_names_from_text(llm_text, pool, pick_n)
+        selected = _pad_selection_to_pick_n(
+            selected,
+            pool,
+            pick_n,
+            purpose,
+            near=start,
+        )
         ordered = order_day_route(start, selected, destination=end) if selected else []
         ordered = enforce_max_hop(
             start,
             ordered,
             day_hop,
-            pool=plan.get("hits") or [],
+            pool=pool,
             purpose=purpose,
             pick_n=pick_n,
             destination=end,
         )
         final_plans.append({**plan, "hits": ordered})
+        for hit in ordered:
+            used_ids.add(str(hit.get("id") or hit.get("name")))
     return final_plans
+
+
+def _pad_selection_to_pick_n(
+    selected: list[dict[str, Any]],
+    pool: list[dict[str, Any]],
+    pick_n: int,
+    purpose: str,
+    *,
+    near: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """LLM 선택이 pick_n보다 적으면 가까운 후보 위주로 채웁니다."""
+    if pick_n <= 0:
+        return []
+    if not selected:
+        return ensure_daily_mix(pool, pick_n, purpose)
+    if len(selected) >= pick_n or not pool:
+        return selected[:pick_n]
+
+    seen = {str(hit.get("id") or hit.get("name")) for hit in selected}
+    padded = list(selected)
+    remaining = [
+        hit for hit in pool if str(hit.get("id") or hit.get("name")) not in seen
+    ]
+
+    def _near_key(hit: dict[str, Any]) -> float:
+        if near is not None:
+            dist = distance_between(near, hit)
+            if dist is not None:
+                return dist
+        return float(hit.get("distance_km") or 999.0)
+
+    # 목적 믹스 우선, 그다음 숙소/출발지에서 가까운 순
+    preferred = ensure_daily_mix(remaining, pick_n, purpose)
+    preferred_ids = {str(h.get("id") or h.get("name")) for h in preferred}
+    leftovers = [h for h in remaining if str(h.get("id") or h.get("name")) not in preferred_ids]
+    leftovers.sort(key=_near_key)
+    preferred_sorted = sorted(preferred, key=_near_key)
+
+    for hit in preferred_sorted + leftovers:
+        key = str(hit.get("id") or hit.get("name"))
+        if key in seen:
+            continue
+        seen.add(key)
+        padded.append(hit)
+        if len(padded) >= pick_n:
+            break
+    return padded[:pick_n]
 
 
 def parse_selected_ids(llm_text: str) -> dict[int, list[str]]:
@@ -477,40 +515,201 @@ def render_composed_course(
     day_plans: list[dict[str, Any]],
     llm_text: str,
 ) -> str:
-    reasons = _extract_reasons(llm_text)
-    lines = [
-        f"## 부산 {request.days}일 여행 코스",
-        "",
-        f"- 기간: {request.start_date.isoformat()} ~ {request.end_date.isoformat()}",
-        f"- 동행: {request.companion} / 목적: {request.purpose} / 활동 강도: {request.intensity}/5",
-        "- 숙소 이중 앵커(전날·당일) · 목적 가중 multi-recall 후, 동선은 전날→당일 숙소 방향으로 정렬했습니다.",
-        "",
-    ]
-    for day_index, plan in enumerate(day_plans, start=1):
-        lines.append(_day_route_header(day_index, plan))
-        if not plan["hits"]:
-            lines.append("- 후보를 확정하지 못했습니다.")
-            lines.append("")
-            continue
-        for place in plan["hits"]:
-            distance = place.get("distance_km")
-            hop = place.get("hop_km")
-            meta = f"{place.get('district')}, {place.get('category')}"
-            if distance is not None:
-                meta += f", 숙소 {distance}km"
-            if hop is not None:
-                meta += f", 이전→{hop}km"
-            name = str(place.get("name") or "")
-            reason = reasons.get(name)
-            if not reason:
-                overview = (place.get("overview") or place.get("page_content") or "").strip()
-                reason = (overview[:80] + "…") if len(overview) > 80 else overview
-            if reason:
-                lines.append(f"- **{name}** ({meta}) — {reason}")
-            else:
-                lines.append(f"- **{name}** ({meta})")
+    return render_course_markdown(
+        request,
+        day_plans,
+        reasons=_extract_reasons(llm_text),
+        draft_note=None,
+    )
+
+
+def render_course_markdown(
+    request: RecommendRequest,
+    day_plans: list[dict[str, Any]],
+    *,
+    reasons: dict[str, str],
+    draft_note: str | None,
+) -> str:
+    purpose = request.purpose
+    title = f"## 부산 {request.days}일 · {purpose} 코스"
+    if draft_note:
+        title += " (초안)"
+
+    intensity_soft = {
+        1: "느긋하게",
+        2: "가벼운 산책",
+        3: "보통 일정",
+        4: "활발하게",
+        5: "많이 걷기",
+    }.get(request.intensity, "")
+    meta = (
+        f"{request.start_date.month}/{request.start_date.day}"
+        f" – {request.end_date.month}/{request.end_date.day}"
+        f"  ·  {request.companion}"
+        f"  ·  {purpose}"
+    )
+    if intensity_soft:
+        meta += f"  ·  {intensity_soft}"
+
+    lines = [title, "", meta, ""]
+    if draft_note:
+        lines.append(f"_{draft_note}_")
         lines.append("")
-    return "\n".join(lines)
+
+    for day_index, plan in enumerate(day_plans, start=1):
+        lines.extend(_format_day_section(day_index, plan, reasons))
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    # trailing rule 제거
+    while lines and lines[-1] in ("", "---"):
+        lines.pop()
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _split_day_slots(
+    hits: list[dict[str, Any]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """확정 장소 순서를 유지한 채 오전/오후/저녁으로 나눕니다."""
+    n = len(hits)
+    if n == 0:
+        return []
+    if n == 1:
+        return [("오전", hits)]
+    if n == 2:
+        return [("오전", hits[:1]), ("오후", hits[1:])]
+
+    base, rem = divmod(n, 3)
+    sizes = [base + (1 if i < rem else 0) for i in range(3)]
+    labels = ("오전", "오후", "저녁")
+    slots: list[tuple[str, list[dict[str, Any]]]] = []
+    offset = 0
+    for label, size in zip(labels, sizes, strict=True):
+        if size <= 0:
+            continue
+        slots.append((label, hits[offset : offset + size]))
+        offset += size
+    return slots
+
+
+_SLOT_HEADINGS = {
+    "오전": "#### 오전",
+    "오후": "#### 오후",
+    "저녁": "#### 저녁",
+}
+
+
+def _human_distance(km: float) -> str:
+    if km < 1.0:
+        meters = int(round(km * 1000 / 10.0) * 10)
+        return f"약 {meters}m"
+    return f"약 {km:.1f}km"
+
+
+def _place_blurb(place: dict[str, Any], reasons: dict[str, str]) -> str:
+    """한 줄 소개. LLM 이유 우선, 없으면 짧은 기본 멘트."""
+    name = str(place.get("name") or "")
+    if name and reasons.get(name):
+        return reasons[name].strip()
+
+    category = str(place.get("category") or "")
+    variants = {
+        "음식점": (
+            "가볍게 쉬어가기 좋은 곳이에요.",
+            "한숨 돌리며 맛보기 좋아요.",
+            "분위기 보며 쉬어가기 좋아요.",
+        ),
+        "문화시설": (
+            "천천히 둘러보기 좋아요.",
+            "조용히 구경하기 좋아요.",
+            "공간 분위기 느껴보기 좋아요.",
+        ),
+        "관광지": (
+            "여유롭게 산책하기 좋아요.",
+            "바람 쐬며 걷기 좋아요.",
+            "가볍게 둘러보기 좋아요.",
+        ),
+        "쇼핑": (
+            "둘러보며 구경하기 좋아요.",
+            "천천히 살펴보기 좋아요.",
+        ),
+        "레포츠": (
+            "몸을 살짝 움직여 보기 좋아요.",
+            "가볍게 체험해 보기 좋아요.",
+        ),
+    }
+    overview = (place.get("overview") or place.get("page_content") or "").strip()
+    if overview and len(overview) <= 48 and not overview.endswith(("이다.", "한다.", "있다.")):
+        return re.sub(r"\s+", " ", overview)
+
+    options = variants.get(category)
+    if not options:
+        return "일정에 맞춰 들르기 좋아요."
+    return options[sum(ord(ch) for ch in name) % len(options)]
+
+
+def _format_day_section(
+    day_index: int,
+    plan: dict[str, Any],
+    reasons: dict[str, str],
+) -> list[str]:
+    lodging = plan["lodging"]
+    start, end = route_start_and_end(lodging, plan.get("anchors"))
+    moving = str(start.get("id")) != str(end.get("id"))
+    trip_date = plan["date"]
+    date_label = (
+        f"{trip_date.month}월 {trip_date.day}일 "
+        f"({WEEKDAYS[trip_date.weekday()]})"
+    )
+
+    lines = [f"### {day_index}일차 · {date_label}", ""]
+    if moving:
+        lines.append(
+            f"🧳 **이동일** · {start.get('name')} → {end.get('name')}"
+        )
+        lines.append("체크아웃 후, 다음 숙소 쪽으로 가볍게 이어가는 하루예요.")
+    else:
+        lines.append(
+            f"🏠 **{lodging.get('name')}** · {lodging.get('district') or '구 미상'}"
+        )
+        address = lodging.get("address")
+        if address:
+            lines.append(f"{address}")
+    lines.append("")
+
+    hits = plan.get("hits") or []
+    if not hits:
+        lines.append("조건에 맞는 장소를 찾지 못했어요. 강도나 숙소를 바꿔 보시면 좋아요.")
+        return lines
+
+    stop_index = 0
+    for slot_label, slot_hits in _split_day_slots(hits):
+        lines.append(_SLOT_HEADINGS.get(slot_label, f"#### {slot_label}"))
+        lines.append("")
+        for place in slot_hits:
+            stop_index += 1
+            name = str(place.get("name") or "이름 없음")
+            district = place.get("district") or "구 미상"
+            category = place.get("category") or "기타"
+            lines.append(f"**{name}**")
+            lines.append(f"{district} · {category}")
+
+            blurb = _place_blurb(place, reasons)
+            if blurb:
+                lines.append(blurb)
+
+            hop = place.get("hop_km")
+            distance = place.get("distance_km")
+            if hop is not None:
+                label = "숙소에서" if stop_index == 1 else "앞에서"
+                lines.append(f"↳ {label} {_human_distance(float(hop))}")
+            elif distance is not None:
+                lines.append(f"↳ 숙소에서 {_human_distance(float(distance))}")
+            lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def _extract_reasons(llm_text: str) -> dict[str, str]:
@@ -524,10 +723,21 @@ def _extract_reasons(llm_text: str) -> dict[str, str]:
         reason = match.group(2).strip()
         if name and reason:
             reasons[name] = reason
+    # 번호 목록 형식도 허용: 1. **이름** ... — 이유
+    numbered = re.compile(
+        r"^\d+\.\s+\*?\*?([^*\n·|(]+?)\*?\*?[^\n]*?[—\-–]\s*(.+)$",
+        flags=re.MULTILINE,
+    )
+    for match in numbered.finditer(llm_text):
+        name = match.group(1).strip()
+        reason = match.group(2).strip()
+        if name and reason and name not in reasons:
+            reasons[name] = reason
     return reasons
 
 
 def _day_route_header(day_index: int, plan: dict[str, Any]) -> str:
+    """하위 호환용 한 줄 헤더 (포맷 헬퍼에서 주로 _format_day_section 사용)."""
     lodging = plan["lodging"]
     start, end = route_start_and_end(lodging, plan.get("anchors"))
     date_text = _format_date(plan["date"])
@@ -631,47 +841,119 @@ def enforce_max_hop(
     pick_n: int,
     destination: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """연속 구간이 hop_limit을 넘으면 같은 날 풀에서 다시 고릅니다."""
-    if not ordered:
-        return []
-    ok = True
-    current = start
-    for place in ordered:
-        hop = distance_between(current, place)
-        if hop is not None and hop > hop_limit:
-            ok = False
-            break
-        current = place
-    if ok:
-        return ordered
+    """hop 상한을 지키며 pick_n까지 채웁니다.
 
-    mixed = ensure_daily_mix(pool, pick_n, purpose)
-    rebuilt = order_day_route(start, mixed, destination=destination)
-    # hop 상한만 다시 검사하며 잘라 넣기
-    trimmed: list[dict[str, Any]] = []
+    먼 지점에서 막히면 숙소 기준 순수 탐욕 경로와 비교해
+    더 많이 채운 쪽을 고릅니다(동일 숙소 2일차 등).
+    """
+    if pick_n <= 0:
+        return []
+
+    def _within_limit(path: list[dict[str, Any]]) -> bool:
+        current = start
+        for place in path:
+            hop = distance_between(current, place)
+            if hop is not None and hop > hop_limit:
+                return False
+            current = place
+        return True
+
+    def _path_score(path: list[dict[str, Any]]) -> tuple[int, float]:
+        """장소 수 우선, 동선 합이 짧을수록 가산."""
+        total = 0.0
+        current = start
+        for place in path:
+            hop = distance_between(current, place)
+            if hop is not None:
+                total += hop
+            current = place
+        return (len(path), -total)
+
+    candidates: list[list[dict[str, Any]]] = []
+
+    if ordered and _within_limit(ordered):
+        kept = list(ordered)[:pick_n]
+        if len(kept) < pick_n:
+            kept = _greedy_fill_hops(
+                start,
+                kept,
+                hop_limit,
+                pool=pool,
+                pick_n=pick_n,
+                destination=destination,
+            )
+        candidates.append(kept)
+
+    mixed = ensure_daily_mix(pool, max(pick_n, 3), purpose)
+    rebuilt: list[dict[str, Any]] = []
     current = start
-    for place in rebuilt:
+    for place in order_day_route(start, mixed, destination=destination):
         hop = distance_between(current, place)
         if hop is not None and hop > hop_limit:
             continue
         item = {**place}
         if hop is not None:
             item["hop_km"] = round(hop, 2)
-        trimmed.append(item)
+        rebuilt.append(item)
         current = place
-        if len(trimmed) >= pick_n:
+        if len(rebuilt) >= pick_n:
             break
-    if len(trimmed) >= min(2, pick_n):
-        return trimmed
+    if len(rebuilt) < pick_n:
+        rebuilt = _greedy_fill_hops(
+            start,
+            rebuilt,
+            hop_limit,
+            pool=pool,
+            pick_n=pick_n,
+            destination=destination,
+        )
+    if rebuilt:
+        candidates.append(rebuilt)
 
-    # 최후: hop만 보고 탐욕
-    seen: set[str] = set()
-    current = start
-    candidates = list(mixed) + [h for h in pool if h not in mixed]
-    while len(trimmed) < pick_n and candidates:
+    pure = _greedy_fill_hops(
+        start,
+        [],
+        hop_limit,
+        pool=pool,
+        pick_n=pick_n,
+        destination=destination,
+    )
+    if pure:
+        candidates.append(pure)
+
+    if not candidates:
+        return list(ordered)[:pick_n]
+
+    best = max(candidates, key=_path_score)
+    return best[:pick_n]
+
+
+def _greedy_fill_hops(
+    start: dict[str, Any],
+    path: list[dict[str, Any]],
+    hop_limit: float,
+    *,
+    pool: list[dict[str, Any]],
+    pick_n: int,
+    destination: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """현재 경로 끝에서 hop 상한 안 후보를 탐욕적으로 이어 붙입니다.
+
+    숙소에 머무는 날은 숙소 근처 밀집 구간을 우선해, 먼 곳으로 빠져
+    pick_n을 못 채우는 경우를 줄입니다.
+    """
+    filled = list(path)
+    seen = {str(hit.get("id") or hit.get("name")) for hit in filled}
+    current = filled[-1] if filled else start
+    moving = (
+        destination is not None
+        and str(destination.get("id") or "") != str(start.get("id") or "")
+    )
+
+    while len(filled) < pick_n:
         best = None
         best_score = float("inf")
-        for hit in candidates:
+        for hit in pool:
             key = str(hit.get("id") or hit.get("name"))
             if key in seen:
                 continue
@@ -680,14 +962,13 @@ def enforce_max_hop(
                 hop = float(hit.get("distance_km") or 999.0)
             if hop > hop_limit:
                 continue
-            score = hop
-            if (
-                destination is not None
-                and str(destination.get("id") or "") != str(start.get("id") or "")
-            ):
+            if moving and destination is not None:
                 to_dest = distance_between(hit, destination)
-                if to_dest is not None:
-                    score = hop + 0.55 * to_dest
+                score = hop + (0.55 * to_dest if to_dest is not None else 0.0)
+            else:
+                to_start = distance_between(start, hit)
+                # 숙소 주변 클러스터를 유지 (먼 전망대 한 곳으로 고립 방지)
+                score = hop + (0.9 * to_start if to_start is not None else 0.0)
             if score < best_score:
                 best = hit
                 best_score = score
@@ -699,10 +980,9 @@ def enforce_max_hop(
         item = {**best}
         if hop is not None:
             item["hop_km"] = round(hop, 2)
-        trimmed.append(item)
+        filled.append(item)
         current = best
-        candidates = [h for h in candidates if str(h.get("id") or h.get("name")) != key]
-    return trimmed if trimmed else ordered
+    return filled
 
 
 def _trip_dates(request: RecommendRequest) -> list[date]:

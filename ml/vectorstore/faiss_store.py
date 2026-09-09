@@ -130,7 +130,9 @@ class FaissStore:
             hit: dict[str, Any] = {"score": float(score), **document}
             if has_geo:
                 distance = _document_distance_km(document, origin_lat, origin_lng)
-                if distance is None or distance > max_distance_km:
+                if distance is None:
+                    continue
+                if distance > max_distance_km:
                     continue
                 hit["distance_km"] = round(distance, 2)
             hits.append(hit)

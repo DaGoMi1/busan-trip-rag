@@ -3,23 +3,33 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from ml.rag.preferences import primary_categories_for_purpose, radius_km
+from ml.rag.preferences import anchor_radius_km, primary_categories_for_purpose
 from ml.rag.routing import distance_between, place_coord
 from ml.vectorstore.faiss_store import haversine_km
 
 
-def radius_compliance(day_plans: list[dict[str, Any]], radius: int) -> float:
-    limit = radius_km(radius)
+def band_compliance(
+    day_plans: list[dict[str, Any]],
+    intensity: int = 3,
+) -> float:
+    """확정 장소가 전날·당일 앵커 중 하나라도 radius_km 이내인지(OR)."""
+    _ = intensity
     total = 0
     ok = 0
-    for plan in day_plans:
+    for day_index, plan in enumerate(day_plans):
+        radius = float(plan.get("radius_km") or anchor_radius_km(day_index))
+        anchors = plan.get("anchors") or [plan.get("lodging") or {}]
         for hit in plan.get("hits") or []:
             total += 1
-            distance = hit.get("distance_km")
-            if distance is None:
-                lodging = plan.get("lodging") or {}
-                distance = distance_between(lodging, hit)
-            if distance is not None and distance <= limit + 1e-6:
+            within = False
+            for anchor in anchors:
+                distance = distance_between(anchor, hit)
+                if distance is not None and float(distance) <= radius + 1e-6:
+                    within = True
+                    break
+            if within:
+                ok += 1
+            elif hit.get("distance_km") is not None and float(hit["distance_km"]) <= radius + 1e-6:
                 ok += 1
     return ok / total if total else 1.0
 
@@ -67,7 +77,6 @@ def food_mix_rate(day_plans: list[dict[str, Any]]) -> float:
 
 
 def primary_share(day_plans: list[dict[str, Any]], purpose: str) -> float:
-    """하루 일정 중 목적 주 카테고리 비율."""
     primary = primary_categories_for_purpose(purpose)
     total = 0
     matched = 0
@@ -104,11 +113,11 @@ def summarize_metrics(
     day_plans: list[dict[str, Any]],
     *,
     purpose: str,
-    radius: int,
+    intensity: int,
     llm_text: str | None = None,
 ) -> dict[str, float]:
     metrics = {
-        "radius_compliance": round(radius_compliance(day_plans, radius), 4),
+        "band_compliance": round(band_compliance(day_plans, intensity), 4),
         "cross_day_overlap": round(cross_day_overlap(day_plans), 4),
         "food_mix_rate": round(food_mix_rate(day_plans), 4),
         "day_compactness": round(day_compactness(day_plans), 4),

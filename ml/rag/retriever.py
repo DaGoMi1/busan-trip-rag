@@ -2,11 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
-from langchain_core.documents import Document
-from langchain_core.retrievers import BaseRetriever
-from pydantic import ConfigDict
-
 from ml.embeddings.embedding_model import EmbeddingModel
 from ml.rag.preferences import LODGING_FIELDS, apply_intensity
 from ml.vectorstore.faiss_store import FaissStore
@@ -55,8 +50,7 @@ class PlaceRetriever:
         query: str,
         k: int = 5,
         category: str | list[str] | None = None,
-        region_zone: str | list[str] | None = None,
-        origin_lat: float | None = None,
+        origin_lat: float | None = None,                        
         origin_lng: float | None = None,
         max_distance_km: float | None = None,
         exclude_ids: set[str] | list[str] | None = None,
@@ -64,10 +58,7 @@ class PlaceRetriever:
         intensity: int | None = None,
     ) -> list[dict[str, Any]]:
         query_vec = self.embedder.encode([query], show_progress=False)
-        filters = {
-            "category": category,
-            "region_zone": region_zone,
-        }
+        filters = {"category": category}
         fetch_k = k * 4 if (exclude_ids or exclude_categories or intensity) else k
         hits = self.store.search(
             query_vec,
@@ -86,54 +77,3 @@ class PlaceRetriever:
         if intensity is not None:
             hits = apply_intensity(hits, intensity)
         return hits[:k]
-
-
-def hit_to_document(hit: dict[str, Any]) -> Document:
-    metadata = {
-        "id": hit.get("id"),
-        "name": hit.get("name"),
-        "category": hit.get("category"),
-        "district": hit.get("district"),
-        "region_zone": hit.get("region_zone"),
-        "address": hit.get("address"),
-        "latitude": hit.get("latitude"),
-        "longitude": hit.get("longitude"),
-        "distance_km": hit.get("distance_km"),
-        "score": hit.get("score"),
-        **(hit.get("metadata") or {}),
-    }
-    return Document(
-        page_content=hit.get("page_content") or hit.get("overview") or "",
-        metadata=metadata,
-    )
-
-
-class LangChainPlaceRetriever(BaseRetriever):
-    """FAISS PlaceRetriever를 LangChain Retriever 인터페이스로 감쌉니다."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    place_retriever: PlaceRetriever
-    k: int = 8
-    category: str | list[str] | None = None
-    region_zone: str | list[str] | None = None
-    origin_lat: float | None = None
-    origin_lng: float | None = None
-    max_distance_km: float | None = None
-
-    def _get_relevant_documents(
-        self,
-        query: str,
-        *,
-        run_manager: CallbackManagerForRetrieverRun,
-    ) -> list[Document]:
-        hits = self.place_retriever.search(
-            query,
-            k=self.k,
-            category=self.category,
-            region_zone=self.region_zone,
-            origin_lat=self.origin_lat,
-            origin_lng=self.origin_lng,
-            max_distance_km=self.max_distance_km,
-        )
-        return [hit_to_document(hit) for hit in hits]

@@ -14,7 +14,6 @@ class RecommendRequest(BaseModel):
     companion: Companion
     purpose: Purpose
     lodging_ids: list[str] = Field(min_length=1)
-    radius: int = Field(ge=1, le=5)
     intensity: int = Field(ge=1, le=5)
 
     @property

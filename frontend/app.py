@@ -7,25 +7,18 @@ API_BASE = "http://localhost:8000"
 MAX_TRIP_DAYS = 7
 PURPOSES = ["힐링", "맛집", "문화관광", "쇼핑", "자연/액티비티", "종합"]
 COMPANIONS = ["혼자", "커플", "친구", "가족", "기타"]
-RADIUS_LABELS = {
-    1: "약 3km · 숙소 근처 도보권",
-    2: "약 6km · 같은 동네 위주",
-    3: "약 10km · 같은 권역",
-    4: "약 15km · 인접 권역까지",
-    5: "약 25km · 시내 이동 허용",
-}
 INTENSITY_LABELS = {
-    1: "움직임 최소 · 카페·실내 위주",
-    2: "가벼운 산책",
-    3: "보통 도보 관광",
-    4: "긴 이동·언덕 괜찮음",
-    5: "산·숲·장거리 걷기 가능",
+    1: "낮음 · 카페·실내, 하루 2~3곳",
+    2: "가벼운 산책 · 하루 3~4곳",
+    3: "보통 · 하루 4~5곳",
+    4: "활발 · 언덕 OK, 하루 5~6곳",
+    5: "높음 · 산·숲 가능, 하루 5~7곳",
 }
 
 st.set_page_config(page_title="부산 여행 코스 추천", page_icon="🏖️", layout="wide")
 
 st.title("🏖️ 부산 여행 코스 추천")
-st.subheader("숙소를 기준으로, 반경 안에서만 하루 코스를 만듭니다")
+st.subheader("전날·당일 숙소 근처에서, 목적에 맞는 하루 코스를 만듭니다")
 
 
 @st.cache_data(ttl=60)
@@ -58,10 +51,12 @@ with st.sidebar:
     end_date = st.date_input("종료일", value=date.today() + timedelta(days=1))
     purpose = st.selectbox("여행 목적", PURPOSES)
     companion = st.selectbox("동행자", COMPANIONS)
-    radius = st.slider("활동 반경", min_value=1, max_value=5, value=3)
-    st.caption(RADIUS_LABELS[radius])
     intensity = st.slider("활동 강도", min_value=1, max_value=5, value=3)
     st.caption(INTENSITY_LABELS[intensity])
+    st.caption(
+        "탐색은 전날 숙소 또는 당일 숙소 각 2km 이내(OR). "
+        "같은 숙소에 여러 날 묵으면 2→3→4km로 조금씩 넓어집니다."
+    )
 
     days = (end_date - start_date).days + 1
     if end_date < start_date:
@@ -119,7 +114,6 @@ if st.button("코스 추천 받기 🚀"):
                         "companion": companion,
                         "purpose": purpose,
                         "lodging_ids": lodging_ids,
-                        "radius": radius,
                         "intensity": intensity,
                     },
                     timeout=120,

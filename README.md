@@ -35,7 +35,7 @@
 | LLM | OpenAI `gpt-4o-mini` (선택) |
 | 데이터 | 한국관광공사 TourAPI 4.0 |
 | Language | Python |
-| AI Agent | Cursor |
+| 개발 | Cursor (AI Agent) |
 
 ---
 

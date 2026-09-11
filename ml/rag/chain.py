@@ -12,13 +12,16 @@ from backend.schemas.request import RecommendRequest
 from ml.rag.preferences import (
     ANCHOR_RADIUS_BASE_KM,
     ANCHOR_RADIUS_CAP_KM,
+    DAILY_PLACE_COUNT,
     INTENSITY_GUIDES,
-    INTENSITY_PICK,
     anchor_radius_km,
     apply_purpose_bonus,
     category_query,
+    daily_slot_template,
     ensure_daily_mix,
+    food_count_for_purpose,
     max_hop_km,
+    place_count_for_purpose,
     quotas_for_purpose,
     stay_index_for_day,
 )
@@ -83,8 +86,9 @@ class CourseRag:
         for_llm: bool,
     ) -> list[dict[str, Any]]:
         dates = _trip_dates(request)
-        pick_n = INTENSITY_PICK[request.intensity]
-        bucket_size = pick_n * 2 if for_llm else pick_n
+        pick_n = DAILY_PLACE_COUNT
+        # LLM용 후보는 슬롯 채울 정도만 — 문맥·토큰 절약
+        bucket_size = pick_n * 2 if for_llm else pick_n * 3
         day_lodgings = _expand_lodgings(lodgings, request.days)
         plans: list[dict[str, Any]] = []
 
@@ -112,7 +116,11 @@ class CourseRag:
                 exclude_ids=exclude,
                 next_lodging=next_lodging,
             )
-            capped = hits[: max(bucket_size + 4, bucket_size)]
+            capped = _cap_hits_preserving_template(
+                hits,
+                max(bucket_size + 4, bucket_size),
+                request.purpose,
+            )
             plans.append(
                 {
                     "date": trip_date,
@@ -124,12 +132,83 @@ class CourseRag:
             )
         return plans
 
+    def _top_up_pool_for_template(
+        self,
+        request: RecommendRequest,
+        pool: list[dict[str, Any]],
+        *,
+        lodging: dict[str, Any],
+        radius_km: float,
+        exclude_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """일차 간 중복 제외 후 음식점·비음식이 부족하면 근처에서 보충합니다."""
+        need_food = food_count_for_purpose(request.purpose)
+        need_place = place_count_for_purpose(request.purpose)
+        have_food = sum(1 for hit in pool if hit.get("category") == "음식점")
+        have_place = sum(1 for hit in pool if hit.get("category") != "음식점")
+        if have_food >= need_food and have_place >= need_place:
+            return pool
+
+        origin_lat = _coord(lodging, "latitude")
+        origin_lng = _coord(lodging, "longitude")
+        district = str(lodging.get("district") or "")
+        extra: list[dict[str, Any]] = []
+        soft_radius = min(max(radius_km + 2.0, 4.0), ANCHOR_RADIUS_CAP_KM)
+
+        if have_food < need_food:
+            query = category_query("음식점", district, request.companion)
+            vecs = self.retriever.encode_queries([query])
+            extra.extend(
+                self.retriever.search(
+                    query=query,
+                    k=max(8, need_food * 3),
+                    category="음식점",
+                    origin_lat=origin_lat,
+                    origin_lng=origin_lng,
+                    max_distance_km=soft_radius,
+                    exclude_ids=exclude_ids,
+                    exclude_categories=["숙박"],
+                    intensity=request.intensity,
+                    query_embedding=vecs.get(query),
+                )
+            )
+        if have_place < need_place:
+            primary = next(
+                (
+                    cat
+                    for cat, count in quotas_for_purpose(request.purpose).items()
+                    if count > 0 and cat != "음식점"
+                ),
+                "관광지",
+            )
+            query = category_query(primary, district, request.companion)
+            vecs = self.retriever.encode_queries([query])
+            extra.extend(
+                self.retriever.search(
+                    query=query,
+                    k=max(8, need_place * 3),
+                    category=primary,
+                    origin_lat=origin_lat,
+                    origin_lng=origin_lng,
+                    max_distance_km=soft_radius,
+                    exclude_ids=exclude_ids,
+                    exclude_categories=["숙박"],
+                    intensity=request.intensity,
+                    query_embedding=vecs.get(query),
+                )
+            )
+
+        if not extra:
+            return pool
+        merged = _merge_anchor_hits(pool + extra, [lodging])
+        return apply_purpose_bonus(merged, request.purpose)
+
     def _narrow_plans(
         self,
         request: RecommendRequest,
         candidate_plans: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        pick_n = INTENSITY_PICK[request.intensity]
+        pick_n = DAILY_PLACE_COUNT
         narrowed: list[dict[str, Any]] = []
         used_ids: set[str] = set()
         for plan in candidate_plans:
@@ -142,6 +221,13 @@ class CourseRag:
                 for hit in plan["hits"]
                 if str(hit.get("id") or hit.get("name")) not in used_ids
             ]
+            pool = self._top_up_pool_for_template(
+                request,
+                pool,
+                lodging=lodging,
+                radius_km=radius,
+                exclude_ids=used_ids | {str(lodging.get("id"))},
+            )
             mixed = ensure_daily_mix(pool, pick_n, request.purpose)
             ordered = order_day_route(start, mixed, destination=end) if mixed else []
             ordered = enforce_max_hop(
@@ -152,6 +238,13 @@ class CourseRag:
                 purpose=request.purpose,
                 pick_n=pick_n,
                 destination=end,
+            )
+            ordered = ensure_meals_in_day_plan(
+                start,
+                ordered,
+                pool=pool,
+                purpose=request.purpose,
+                pick_n=pick_n,
             )
             narrowed.append({**plan, "hits": ordered})
             for hit in ordered:
@@ -168,7 +261,7 @@ class CourseRag:
         next_lodging: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         quotas = quotas_for_purpose(request.purpose)
-        pooled: list[dict[str, Any]] = []
+        jobs: list[dict[str, Any]] = []
 
         for lodging in anchors:
             origin_lat = _coord(lodging, "latitude")
@@ -177,36 +270,60 @@ class CourseRag:
             for category, count in quotas.items():
                 if count <= 0:
                     continue
-                hits = self.retriever.search(
-                    category_query(category, district, request.companion),
-                    k=count,
-                    category=category,
-                    origin_lat=origin_lat,
-                    origin_lng=origin_lng,
-                    max_distance_km=radius_km,
-                    exclude_ids=exclude_ids,
-                    exclude_categories=["숙박"],
-                    intensity=request.intensity,
+                jobs.append(
+                    {
+                        "query": category_query(category, district, request.companion),
+                        "k": count,
+                        "category": category,
+                        "origin_lat": origin_lat,
+                        "origin_lng": origin_lng,
+                        "max_distance_km": radius_km,
+                    }
                 )
-                pooled.extend(hits)
 
-            if len(pooled) < max(3, INTENSITY_PICK[request.intensity] - 1):
+        query_vecs = self.retriever.encode_queries(
+            [str(job["query"]) for job in jobs]
+        )
+        pooled: list[dict[str, Any]] = []
+        for job in jobs:
+            hits = self.retriever.search(
+                query=str(job["query"]),
+                k=int(job["k"]),
+                category=job["category"],
+                origin_lat=job["origin_lat"],
+                origin_lng=job["origin_lng"],
+                max_distance_km=job["max_distance_km"],
+                exclude_ids=exclude_ids,
+                exclude_categories=["숙박"],
+                intensity=request.intensity,
+                query_embedding=query_vecs.get(str(job["query"])),
+            )
+            pooled.extend(hits)
+
+        if len(pooled) < max(3, DAILY_PLACE_COUNT - 1):
+            for lodging in anchors:
+                origin_lat = _coord(lodging, "latitude")
+                origin_lng = _coord(lodging, "longitude")
+                district = str(lodging.get("district") or "")
+                query = category_query("관광지", district, request.companion)
+                vecs = self.retriever.encode_queries([query])
                 fallback = self.retriever.search(
-                    category_query("관광지", district, request.companion),
-                    k=INTENSITY_PICK[request.intensity] * 2,
+                    query=query,
+                    k=DAILY_PLACE_COUNT * 2,
                     origin_lat=origin_lat,
                     origin_lng=origin_lng,
                     max_distance_km=radius_km,
                     exclude_ids=exclude_ids,
                     exclude_categories=["숙박"],
                     intensity=request.intensity,
+                    query_embedding=vecs.get(query),
                 )
                 pooled.extend(fallback)
 
         pooled = _merge_anchor_hits(pooled, anchors)
         if len(pooled) < 2:
-            # 후보가 거의 없을 때만 반경 +1km 완화
             soft_radius = min(radius_km + 1.0, ANCHOR_RADIUS_CAP_KM)
+            soft_jobs: list[dict[str, Any]] = []
             for lodging in anchors:
                 origin_lat = _coord(lodging, "latitude")
                 origin_lng = _coord(lodging, "longitude")
@@ -216,15 +333,27 @@ class CourseRag:
                     if request.purpose == "맛집"
                     else category_query("관광지", district, request.companion)
                 )
+                soft_jobs.append(
+                    {
+                        "query": query,
+                        "origin_lat": origin_lat,
+                        "origin_lng": origin_lng,
+                    }
+                )
+            soft_vecs = self.retriever.encode_queries(
+                [str(job["query"]) for job in soft_jobs]
+            )
+            for job in soft_jobs:
                 soft = self.retriever.search(
-                    query,
-                    k=INTENSITY_PICK[request.intensity] * 3,
-                    origin_lat=origin_lat,
-                    origin_lng=origin_lng,
+                    query=str(job["query"]),
+                    k=DAILY_PLACE_COUNT * 3,
+                    origin_lat=job["origin_lat"],
+                    origin_lng=job["origin_lng"],
                     max_distance_km=soft_radius,
                     exclude_ids=exclude_ids,
                     exclude_categories=["숙박"],
                     intensity=request.intensity,
+                    query_embedding=soft_vecs.get(str(job["query"])),
                 )
                 pooled.extend(soft)
             pooled = _merge_anchor_hits(pooled, anchors)
@@ -239,7 +368,7 @@ class CourseRag:
         request: RecommendRequest,
         candidate_plans: list[dict[str, Any]],
     ) -> str:
-        pick_n = INTENSITY_PICK[request.intensity]
+        pick_n = DAILY_PLACE_COUNT
         radii = [float(plan.get("radius_km") or 2.0) for plan in candidate_plans]
         if radii:
             band_text = (
@@ -267,6 +396,13 @@ class CourseRag:
             pick_n,
             purpose=request.purpose,
             intensity=request.intensity,
+            pool_enricher=lambda pool, plan, used: self._top_up_pool_for_template(
+                request,
+                pool,
+                lodging=plan["lodging"],
+                radius_km=float(plan.get("radius_km") or ANCHOR_RADIUS_BASE_KM),
+                exclude_ids=used | {str(plan["lodging"].get("id"))},
+            ),
         )
         if not any(plan["hits"] for plan in final_plans):
             final_plans = self._narrow_plans(request, candidate_plans)
@@ -278,7 +414,7 @@ class CourseRag:
         if self._rag_chain is None:
             from langchain_openai import ChatOpenAI
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, max_tokens=700)
             self._rag_chain = create_course_chain(llm)
         return self._rag_chain
 
@@ -297,6 +433,43 @@ class CourseRag:
 
 def create_course_chain(llm) -> Any:
     return RunnablePassthrough() | course_prompt() | llm | StrOutputParser()
+
+
+def _cap_hits_preserving_template(
+    hits: list[dict[str, Any]],
+    limit: int,
+    purpose: str,
+) -> list[dict[str, Any]]:
+    """점수 상위 절단 시에도 슬롯용 음식점·비음식 후보를 남깁니다."""
+    if limit <= 0 or not hits:
+        return []
+    if len(hits) <= limit:
+        return hits
+
+    need_food = food_count_for_purpose(purpose) * 3
+    need_place = place_count_for_purpose(purpose) * 3
+    foods = [hit for hit in hits if hit.get("category") == "음식점"]
+    places = [hit for hit in hits if hit.get("category") != "음식점"]
+
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(place: dict[str, Any]) -> None:
+        key = str(place.get("id") or place.get("name"))
+        if key in seen or len(selected) >= limit:
+            return
+        seen.add(key)
+        selected.append(place)
+
+    for hit in foods[:need_food]:
+        _add(hit)
+    for hit in places[:need_place]:
+        _add(hit)
+    for hit in hits:
+        if len(selected) >= limit:
+            break
+        _add(hit)
+    return selected
 
 
 def format_day_plans_by_category(day_plans: list[dict[str, Any]]) -> str:
@@ -329,8 +502,14 @@ def format_day_plans_by_category(day_plans: list[dict[str, Any]]) -> str:
         if not hits:
             blocks.append(header + "\n후보 없음")
             continue
+        # 점수 상위만 LLM에 넘겨 문맥을 줄입니다
+        ranked = sorted(
+            hits,
+            key=lambda item: float(item.get("score") or 0.0),
+            reverse=True,
+        )[:14]
         by_category: dict[str, list[dict[str, Any]]] = {}
-        for hit in hits:
+        for hit in ranked:
             by_category.setdefault(str(hit.get("category") or "기타"), []).append(hit)
         sections: list[str] = []
         ordered_cats = [c for c in CATEGORY_ORDER if c in by_category]
@@ -347,9 +526,8 @@ def format_day_plans_by_category(day_plans: list[dict[str, Any]]) -> str:
                 )
                 lines.append(
                     f"[id={place_id}] {hit.get('name')} | {hit.get('district')} | "
-                    f"{hit.get('region_zone')}{distance_text}\n"
-                    f"주소: {hit.get('address')}\n"
-                    f"설명: {overview[:300]}"
+                    f"{hit.get('category')}{distance_text}\n"
+                    f"설명: {overview[:120]}"
                 )
             sections.append("\n".join(lines))
         blocks.append(header + "\n\n" + "\n\n".join(sections))
@@ -363,6 +541,7 @@ def apply_llm_selections(
     *,
     purpose: str,
     intensity: int = 3,
+    pool_enricher: Any | None = None,
 ) -> list[dict[str, Any]]:
     selected_by_day = parse_selected_ids(llm_text)
     final_plans: list[dict[str, Any]] = []
@@ -377,6 +556,8 @@ def apply_llm_selections(
             for hit in plan.get("hits") or []
             if str(hit.get("id") or hit.get("name")) not in used_ids
         ]
+        if pool_enricher is not None:
+            pool = pool_enricher(pool, plan, used_ids)
         id_map = {
             str(hit.get("id") or hit.get("name")): hit for hit in pool
         }
@@ -416,6 +597,13 @@ def apply_llm_selections(
             pick_n=pick_n,
             destination=end,
         )
+        ordered = ensure_meals_in_day_plan(
+            start,
+            ordered,
+            pool=pool,
+            purpose=purpose,
+            pick_n=pick_n,
+        )
         final_plans.append({**plan, "hits": ordered})
         for hit in ordered:
             used_ids.add(str(hit.get("id") or hit.get("name")))
@@ -451,7 +639,7 @@ def _pad_selection_to_pick_n(
                 return dist
         return float(hit.get("distance_km") or 999.0)
 
-    # 목적 믹스 우선, 그다음 숙소/출발지에서 가까운 순
+    # 목적 믹스 우선(식사 슬롯 포함), 그다음 숙소에서 가까운 순
     preferred = ensure_daily_mix(remaining, pick_n, purpose)
     preferred_ids = {str(h.get("id") or h.get("name")) for h in preferred}
     leftovers = [h for h in remaining if str(h.get("id") or h.get("name")) not in preferred_ids]
@@ -467,6 +655,105 @@ def _pad_selection_to_pick_n(
         if len(padded) >= pick_n:
             break
     return padded[:pick_n]
+
+
+def _slot_sizes(n: int) -> list[int]:
+    """하루 6곳이면 [2,2,2], 그 미만은 균등 분배."""
+    if n <= 0:
+        return []
+    if n >= DAILY_PLACE_COUNT:
+        return [2, 2, 2]
+    if n == 1:
+        return [1]
+    if n == 2:
+        return [1, 1]
+    base, rem = divmod(n, 3)
+    return [base + (1 if i < rem else 0) for i in range(3)]
+
+
+def _recompute_hops(
+    start: dict[str, Any],
+    path: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rebuilt: list[dict[str, Any]] = []
+    current = start
+    for place in path:
+        hop = distance_between(current, place)
+        item = {**place}
+        if hop is not None:
+            item["hop_km"] = round(hop, 2)
+        else:
+            item.pop("hop_km", None)
+        rebuilt.append(item)
+        current = place
+    return rebuilt
+
+
+def arrange_meals_in_slots(
+    hits: list[dict[str, Any]],
+    purpose: str,
+) -> list[dict[str, Any]]:
+    """목적별 슬롯 템플릿(place/food) 순서로 하루 일정을 재배치합니다."""
+    if not hits:
+        return hits
+
+    template = daily_slot_template(purpose)
+    foods = [hit for hit in hits if hit.get("category") == "음식점"]
+    places = [hit for hit in hits if hit.get("category") != "음식점"]
+    food_i = 0
+    place_i = 0
+    result: list[dict[str, Any]] = []
+
+    for slot in template:
+        for role in slot:
+            chosen = None
+            if role == "food" and food_i < len(foods):
+                chosen = foods[food_i]
+                food_i += 1
+            elif role == "place" and place_i < len(places):
+                chosen = places[place_i]
+                place_i += 1
+            if chosen is not None:
+                result.append(chosen)
+
+    # 템플릿에 못 채운 자리는 남는 후보로만 뒤에 이어 붙임(역할 뒤섞지 않음)
+    leftovers = foods[food_i:] + places[place_i:]
+    for hit in leftovers:
+        if len(result) >= DAILY_PLACE_COUNT:
+            break
+        key = str(hit.get("id") or hit.get("name"))
+        if any(str(r.get("id") or r.get("name")) == key for r in result):
+            continue
+        result.append(hit)
+    return result[:DAILY_PLACE_COUNT]
+
+
+def ensure_meals_in_day_plan(
+    start: dict[str, Any],
+    ordered: list[dict[str, Any]],
+    *,
+    pool: list[dict[str, Any]],
+    purpose: str,
+    pick_n: int,
+) -> list[dict[str, Any]]:
+    """템플릿에 맞게 음식점·비음식 장소를 풀에서 다시 맞춰 슬롯 순서로 배치합니다."""
+    target_n = min(pick_n, DAILY_PLACE_COUNT) if pick_n > 0 else DAILY_PLACE_COUNT
+    if target_n <= 0:
+        return []
+
+    # 동선으로 고른 결과를 앞에 두고, 부족분은 풀에서 템플릿 수량으로 채움
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for hit in list(ordered) + list(pool):
+        key = str(hit.get("id") or hit.get("name"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(hit)
+
+    mixed = ensure_daily_mix(merged, target_n, purpose)
+    arranged = arrange_meals_in_slots(mixed, purpose)
+    return _recompute_hops(start, arranged)
 
 
 def parse_selected_ids(llm_text: str) -> dict[int, list[str]]:
@@ -535,33 +822,29 @@ def render_course_markdown(
     if draft_note:
         title += " (초안)"
 
-    intensity_soft = {
-        1: "느긋하게",
-        2: "가벼운 산책",
-        3: "보통 일정",
-        4: "활발하게",
-        5: "많이 걷기",
-    }.get(request.intensity, "")
-    meta = (
-        f"{request.start_date.month}/{request.start_date.day}"
-        f" – {request.end_date.month}/{request.end_date.day}"
-        f"  ·  {request.companion}"
-        f"  ·  {purpose}"
-    )
-    if intensity_soft:
-        meta += f"  ·  {intensity_soft}"
+    intensity_soft = INTENSITY_GUIDES.get(request.intensity, "")
 
-    lines = [title, "", meta, ""]
+    lines = [
+        title,
+        "",
+        (
+            f"- **기간:** {request.start_date.month}/{request.start_date.day}"
+            f" – {request.end_date.month}/{request.end_date.day}"
+        ),
+        f"- **동행:** {request.companion}",
+        f"- **목적:** {purpose}",
+    ]
+    if intensity_soft:
+        lines.append(f"- **강도:** {intensity_soft}")
     if draft_note:
-        lines.append(f"_{draft_note}_")
-        lines.append("")
+        lines.append(f"- _{draft_note}_")
+    lines.append("")
 
     for day_index, plan in enumerate(day_plans, start=1):
         lines.extend(_format_day_section(day_index, plan, reasons))
         lines.append("")
         lines.append("---")
         lines.append("")
-    # trailing rule 제거
     while lines and lines[-1] in ("", "---"):
         lines.pop()
     return "\n".join(lines).rstrip() + "\n"
@@ -574,14 +857,8 @@ def _split_day_slots(
     n = len(hits)
     if n == 0:
         return []
-    if n == 1:
-        return [("오전", hits)]
-    if n == 2:
-        return [("오전", hits[:1]), ("오후", hits[1:])]
-
-    base, rem = divmod(n, 3)
-    sizes = [base + (1 if i < rem else 0) for i in range(3)]
-    labels = ("오전", "오후", "저녁")
+    sizes = _slot_sizes(n)
+    labels = ("오전", "오후", "저녁")[: len(sizes)]
     slots: list[tuple[str, list[dict[str, Any]]]] = []
     offset = 0
     for label, size in zip(labels, sizes, strict=True):
@@ -662,19 +939,24 @@ def _format_day_section(
         f"({WEEKDAYS[trip_date.weekday()]})"
     )
 
+    # ### 일차 / #### 시간대 — 리스트로 줄바꿈을 강제해 Streamlit 가독성 확보
     lines = [f"### {day_index}일차 · {date_label}", ""]
+
     if moving:
+        lines.append("🧳 **이동일**")
+        lines.append("")
         lines.append(
-            f"🧳 **이동일** · {start.get('name')} → {end.get('name')}"
+            f"- **동선:** {start.get('name')} → {end.get('name')}"
         )
-        lines.append("체크아웃 후, 다음 숙소 쪽으로 가볍게 이어가는 하루예요.")
+        lines.append("- 체크아웃 후, 다음 숙소 쪽으로 가볍게 이어가는 하루예요.")
     else:
-        lines.append(
-            f"🏠 **{lodging.get('name')}** · {lodging.get('district') or '구 미상'}"
-        )
+        district = lodging.get("district") or "구 미상"
+        lines.append(f"🏠 **{lodging.get('name')}**")
+        lines.append("")
+        lines.append(f"- **구:** {district}")
         address = lodging.get("address")
         if address:
-            lines.append(f"{address}")
+            lines.append(f"- **주소:** {address}")
     lines.append("")
 
     hits = plan.get("hits") or []
@@ -691,20 +973,27 @@ def _format_day_section(
             name = str(place.get("name") or "이름 없음")
             district = place.get("district") or "구 미상"
             category = place.get("category") or "기타"
-            lines.append(f"**{name}**")
-            lines.append(f"{district} · {category}")
+
+            lines.append(f"**{stop_index}. {name}**")
+            lines.append("")
+            lines.append(f"- **구:** {district}")
+            lines.append(f"- **카테고리:** {category}")
 
             blurb = _place_blurb(place, reasons)
             if blurb:
-                lines.append(blurb)
+                lines.append(f"- **소개:** {blurb}")
 
             hop = place.get("hop_km")
             distance = place.get("distance_km")
             if hop is not None:
                 label = "숙소에서" if stop_index == 1 else "앞에서"
-                lines.append(f"↳ {label} {_human_distance(float(hop))}")
+                lines.append(
+                    f"- **이동:** {label} {_human_distance(float(hop))}"
+                )
             elif distance is not None:
-                lines.append(f"↳ 숙소에서 {_human_distance(float(distance))}")
+                lines.append(
+                    f"- **이동:** 숙소에서 {_human_distance(float(distance))}"
+                )
             lines.append("")
 
     while lines and lines[-1] == "":

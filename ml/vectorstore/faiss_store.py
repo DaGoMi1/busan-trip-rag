@@ -111,6 +111,7 @@ class FaissStore:
             filters and any(value not in (None, "", [], ()) for value in filters.values())
         )
         if has_geo:
+            # 반경 필터는 누락 방지를 위해 전체 후보를 본 뒤 자른다
             fetch_k = len(self.documents)
         elif has_filters:
             fetch_k = min(len(self.documents), max(k * oversample, k))

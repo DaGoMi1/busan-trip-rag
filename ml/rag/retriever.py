@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 from ml.embeddings.embedding_model import EmbeddingModel
 from ml.rag.preferences import LODGING_FIELDS, apply_intensity
 from ml.vectorstore.faiss_store import FaissStore
@@ -29,7 +31,7 @@ class PlaceRetriever:
                 return document
         return None
 
-    def list_lodgings(self, query: str = "") -> list[dict[str, Any]]:
+    def list_lodgings(self, query: str = "") -> list[dict]:
         needle = query.strip().lower()
         lodgings: list[dict[str, Any]] = []
         for document in self.store.documents:
@@ -45,23 +47,40 @@ class PlaceRetriever:
             lodgings.append({field: document.get(field) for field in LODGING_FIELDS})
         return lodgings
 
+    def encode_queries(self, queries: list[str]) -> dict[str, np.ndarray]:
+        """고유 쿼리만 배치 임베딩해 {query: vector} 맵을 만듭니다."""
+        unique = list(dict.fromkeys(q for q in queries if q))
+        if not unique:
+            return {}
+        vectors = self.embedder.encode(unique, show_progress=False)
+        return {
+            query: np.asarray(vectors[index], dtype="float32")
+            for index, query in enumerate(unique)
+        }
+
     def search(
         self,
-        query: str,
+        query: str = "",
         k: int = 5,
         category: str | list[str] | None = None,
-        origin_lat: float | None = None,                        
+        origin_lat: float | None = None,
         origin_lng: float | None = None,
         max_distance_km: float | None = None,
         exclude_ids: set[str] | list[str] | None = None,
         exclude_categories: set[str] | list[str] | None = None,
         intensity: int | None = None,
+        query_embedding: np.ndarray | None = None,
     ) -> list[dict[str, Any]]:
-        query_vec = self.embedder.encode([query], show_progress=False)
+        if query_embedding is None:
+            if not query:
+                return []
+            query_embedding = self.embedder.encode([query], show_progress=False)[0]
+
         filters = {"category": category}
-        fetch_k = k * 4 if (exclude_ids or exclude_categories or intensity) else k
+        # intensity/exclude는 후처리이므로 oversample만 적당히
+        fetch_k = k * 3 if (exclude_ids or exclude_categories or intensity) else k
         hits = self.store.search(
-            query_vec,
+            query_embedding,
             k=fetch_k,
             filters=filters,
             origin_lat=origin_lat,
